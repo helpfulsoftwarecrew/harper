@@ -218,6 +218,7 @@ async function descTable(describeTableObject: any, attrPerms?: any) {
 	};
 	if (tableObj.replicate !== undefined) tableResult.replicate = tableObj.replicate;
 	if (tableObj.expirationMS !== undefined) tableResult.expiration = tableObj.expirationMS / 1000 + 's';
+	if ((tableObj as any).jitterMS) tableResult.jitter = (tableObj as any).jitterMS + 'ms';
 	if (tableObj.sealed !== undefined) tableResult.sealed = tableObj.sealed;
 	if (tableObj.cacheControl != null) tableResult.cacheControl = tableObj.cacheControl;
 	if ((tableObj as any).sources?.length > 0)

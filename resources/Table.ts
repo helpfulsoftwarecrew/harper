@@ -177,6 +177,7 @@ import {
 	storedFieldsOnly,
 } from './RecordEncoder.ts';
 import { recordAction, recordActionBinary } from './analytics/write.ts';
+import { expirationJitter, normalizeJitter } from './expirationJitter.ts';
 import { commutativeOpsOf, rebuildUpdateBefore } from './crdt.ts';
 import { appendHeader } from '../server/serverHelpers/Headers.ts';
 import fs from 'node:fs';
@@ -805,6 +806,7 @@ interface TableResourceClass {
 	getResidencyById: (id: Id) => number | void;
 	get expirationMS(): any;
 	get evictionMS(): any;
+	get jitterMS(): number;
 	dbisDB: any;
 	schemaDefined: any;
 	/**
@@ -836,6 +838,7 @@ interface TableResourceClass {
 	 * and `scanInterval` (all in seconds, all optional). Number form preserves any previously configured
 	 * eviction/scanInterval; object form replaces all three. An internal schema ownership-only call with
 	 * none of those values preserves the settings already loaded from the catalog.
+	 * The object form also sets `jitter`, a maximum in milliseconds; the number form preserves it.
 	 */
 	setTTLExpiration(
 		opts:
@@ -844,6 +847,7 @@ interface TableResourceClass {
 					expiration?: number;
 					eviction?: number;
 					scanInterval?: number;
+					jitter?: number | false;
 					fromSchema?: boolean;
 					isolatedApplicationOwner?: boolean;
 			  }
@@ -1397,6 +1401,9 @@ export function makeTable(options): TableResourceClass {
 	let expirationScanScheduled = false;
 	// set on the first expiring write so the unscheduled-expiration warning is evaluated at most once per table
 	let expirationWarningChecked = false;
+	// Widest extra delay, in ms, added to a computed expiry; 0 is off. Unlike expiration/eviction it
+	// is not persisted, so like scanInterval it is re-applied from schema or sourcedFrom() on load.
+	let jitterMaxMs = 0;
 	let propertyResolvers: any;
 	let hasRelationships = false;
 	// Attribute names surfaced by the struct `toJSON` on the default (no-select) read: everything that is
@@ -1772,6 +1779,9 @@ export function makeTable(options): TableResourceClass {
 		static get evictionMS() {
 			return evictionMs;
 		}
+		static get jitterMS() {
+			return jitterMaxMs;
+		}
 		static dbisDB = dbisDb;
 		static schemaDefined = schemaDefined;
 		/**
@@ -1787,7 +1797,8 @@ export function makeTable(options): TableResourceClass {
 			// define a source for retrieving invalidated entries for caching purposes
 			if (options) {
 				this.sourceOptions = options;
-				if (options.expiration || options.eviction || options.scanInterval) this.setTTLExpiration(options);
+				if (options.expiration || options.eviction || options.scanInterval || options.jitter)
+					this.setTTLExpiration(options);
 			}
 			if (options?.intermediateSource) {
 				source.intermediateSource = true;
@@ -2644,6 +2655,7 @@ export function makeTable(options): TableResourceClass {
 		 * and `scanInterval` (all in seconds, all optional). Number form preserves any previously configured
 		 * eviction/scanInterval; object form replaces all three. An internal schema ownership-only call with
 		 * none of those values preserves the settings already loaded from the catalog.
+		 * The object form also sets `jitter`, a maximum in milliseconds; the number form preserves it.
 		 */
 		static setTTLExpiration(
 			opts:
@@ -2652,6 +2664,7 @@ export function makeTable(options): TableResourceClass {
 						expiration?: number;
 						eviction?: number;
 						scanInterval?: number;
+						jitter?: number | false;
 						fromSchema?: boolean;
 						isolatedApplicationOwner?: boolean;
 				  }
@@ -2661,7 +2674,11 @@ export function makeTable(options): TableResourceClass {
 			const declaredHere = typeof opts === 'object' && opts.fromSchema;
 			const isolatedApplicationOwner = declaredHere && opts.isolatedApplicationOwner;
 			const preserveLoadedConfiguration =
-				declaredHere && opts.expiration === undefined && opts.eviction === undefined && opts.scanInterval === undefined;
+				declaredHere &&
+				opts.expiration === undefined &&
+				opts.eviction === undefined &&
+				opts.scanInterval === undefined &&
+				!normalizeJitter(opts.jitter);
 			if (((!ttlFromLoad && !declaredHere) || isolatedApplicationOwner) && !ttlConfiguredByApplication) {
 				ttlConfiguredByApplication = true;
 				// the scan owner may have changed with this: re-evaluate even if the interval did not
@@ -2674,6 +2691,7 @@ export function makeTable(options): TableResourceClass {
 				expirationMs = (opts.expiration ?? 0) * 1000;
 				evictionMs = (opts.eviction ?? 0) * 1000;
 				cleanupInterval = (opts.scanInterval ?? 0) * 1000;
+				jitterMaxMs = normalizeJitter(opts.jitter);
 			}
 			if (expirationMs < 0) throw new Error('Expiration can not be negative');
 			if (!preserveLoadedConfiguration) {
@@ -5161,7 +5179,7 @@ export function makeTable(options): TableResourceClass {
 							Number.isFinite(fieldExpiresAtMs) && fieldExpiresAtMs >= 0
 								? fieldExpiresAtMs
 								: expirationMs
-									? expirationMs + Date.now()
+									? expirationMs + Date.now() + expirationJitter(id, jitterMaxMs) // only the table default is jittered
 									: -1;
 					}
 					if (!fullUpdate) {
@@ -9025,7 +9043,8 @@ export function makeTable(options): TableResourceClass {
 					recordAction(resolveDuration, 'cache-resolution', tableName, null, 'success');
 					if (responseHeaders)
 						appendHeader(responseHeaders, 'Server-Timing', `cache-resolve;dur=${resolveDuration.toFixed(2)}`, true);
-					if (expirationMs && sourceContext.expiresAt == undefined) sourceContext.expiresAt = Date.now() + expirationMs;
+					if (expirationMs && sourceContext.expiresAt == undefined)
+						sourceContext.expiresAt = Date.now() + expirationMs + expirationJitter(id, jitterMaxMs);
 					if (updatedRecord) {
 						if (typeof updatedRecord !== 'object') throw new Error('Only objects can be cached and stored in tables');
 						if (updatedRecord.status > 0 && updatedRecord.headers) {

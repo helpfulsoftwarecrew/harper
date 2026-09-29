@@ -2160,6 +2160,8 @@ interface TableDefinition {
 	expiration?: number;
 	eviction?: number;
 	scanInterval?: number;
+	// widest extra delay in MILLISECONDS added to a record's computed expiry; false/0 is off
+	jitter?: number | false;
 	audit?: boolean;
 	sealed?: boolean;
 	splitSegments?: boolean;
@@ -3238,6 +3240,7 @@ function openIndex(dbiKey: string, rootStore: RootDatabaseKind, attribute: any, 
  * @param expiration
  * @param eviction
  * @param scanInterval
+ * @param jitter
  * @param attributes
  * @param audit
  * @param sealed
@@ -3352,6 +3355,7 @@ function declareTable<TableResourceType>(target: TableTarget, tableDefinition: T
 		expiration,
 		eviction,
 		scanInterval,
+		jitter,
 		attributes,
 		audit,
 		sealed,
@@ -4704,11 +4708,12 @@ function declareTable<TableResourceType>(target: TableTarget, tableDefinition: T
 	if ((hasChanges || refreshRelationshipAttributes) && !target.branch) {
 		databaseEventsEmitter.emit('updateTable', Table, origin !== 'cluster');
 	}
-	if (expiration || eviction || scanInterval || attributes.some((attribute) => attribute.expiresAt))
+	if (expiration || eviction || scanInterval || jitter || attributes.some((attribute) => attribute.expiresAt))
 		Table.setTTLExpiration({
 			expiration,
 			eviction,
 			scanInterval,
+			jitter,
 			fromSchema: true,
 			isolatedApplicationOwner,
 		});

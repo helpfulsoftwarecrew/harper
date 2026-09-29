@@ -276,6 +276,8 @@ export interface DefineTableOptions {
 	expiration?: number;
 	eviction?: number;
 	scanInterval?: number;
+	/** Widest extra delay in MILLISECONDS added to a record's computed expiry. `false` (default) is off. */
+	jitter?: number | false;
 	splitSegments?: boolean;
 	trackDeletes?: boolean;
 	randomAccessFields?: boolean;
