@@ -539,12 +539,8 @@ async function loadModuleWithVM(moduleUrl: string, scope: ApplicationScope, useC
 
 	function isApplicationLocalModule(url: string): boolean {
 		if (!scope.runtimeRoot || !url.startsWith('file://') || url.includes('/node_modules/')) return false;
-		const modulePath = fileURLToPath(url);
-		const relativePath = relative(resolve(scope.runtimeRoot), modulePath);
-		return (
-			relativePath === '' ||
-			(!relativePath.startsWith(`..${sep}`) && relativePath !== '..' && !isAbsolute(relativePath))
-		);
+		// The URL arrives realpathed and resolve() does not follow symlinks, so both sides are resolved.
+		return isWithin(resolveRealPath(resolve(scope.runtimeRoot)), resolveRealPath(fileURLToPath(url)));
 	}
 
 	/**
@@ -1202,6 +1198,26 @@ function createSpawn(spawnFunction: (...args: any) => child_process.ChildProcess
 	};
 }
 
+/** Whether `target` is `root` or under it, by path segment: a string prefix puts /apps-evil inside /apps. */
+function isWithin(root: string, target: string): boolean {
+	const relativePath = relative(root, target);
+	return (
+		relativePath === '' || (!relativePath.startsWith(`..${sep}`) && relativePath !== '..' && !isAbsolute(relativePath))
+	);
+}
+
+/**
+ * The path with its symlinks resolved, or as given when that fails, since a grant may name a directory
+ * created later. Both boundary checks compare a module and a root only after both pass through it.
+ */
+function resolveRealPath(target: string): string {
+	try {
+		return realpathSync(target);
+	} catch {
+		return target;
+	}
+}
+
 /**
  * Validates whether a module can be loaded based on security restrictions and returns the module path or replacement.
  * For file URLs, ensures the module is within the allowed path.
@@ -1214,11 +1230,8 @@ function createSpawn(spawnFunction: (...args: any) => child_process.ChildProcess
  */
 function checkAllowedModulePath(moduleUrl: string, allowedPath?: string): boolean {
 	if (moduleUrl.startsWith('file:')) {
-		let path = fileURLToPath(moduleUrl);
-		try {
-			path = realpathSync(path);
-		} catch {}
-		if (!allowedPath || path.startsWith(allowedPath)) {
+		const path = resolveRealPath(fileURLToPath(moduleUrl));
+		if (!allowedPath || isWithin(resolveRealPath(allowedPath), path)) {
 			return;
 		}
 		throw new Error(`Can not load module at ${path} outside of allowed path ${allowedPath}`);

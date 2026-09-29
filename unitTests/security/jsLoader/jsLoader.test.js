@@ -1,6 +1,6 @@
 'use strict';
 
-const { mkdirSync, mkdtempSync, rmSync, writeFileSync } = require('node:fs');
+const { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { pathToFileURL } = require('node:url');
@@ -361,5 +361,45 @@ describe('native addon delegation', () => {
 			error = caught;
 		}
 		expect(error?.message).to.include('outside of allowed path');
+	});
+
+	// '../addon.node' in the case above fails a prefix check as well, so only a sibling name tests containment.
+	it('NEGATIVE: a sibling directory whose name begins with the allowed path is not inside it', async () => {
+		const allowedPath = join(runtimeRoot, 'allowed');
+		const siblingPath = join(runtimeRoot, 'allowed-evil');
+		mkdirSync(allowedPath, { recursive: true });
+		mkdirSync(siblingPath, { recursive: true });
+		const wrapperPath = join(allowedPath, 'sibling-wrapper.cjs');
+		writeFileSync(wrapperPath, "module.exports = require('../allowed-evil/addon.node');\n");
+		writeFileSync(join(siblingPath, 'addon.node'), '');
+		require.extensions['.node'] = (module) => {
+			module.exports = { delegated: true };
+		};
+		let error;
+		try {
+			await scopedImport(wrapperPath, { ...vmScope(), runtimeRoot, allowedPath });
+		} catch (caught) {
+			error = caught;
+		}
+		expect(error?.message, 'a sibling of the allowed directory was loaded from').to.include('outside of allowed path');
+	});
+
+	it('a module inside the allowed path loads when that path is reached through a symlink', async () => {
+		const realDirectory = join(realpathSync(runtimeRoot), 'allowed-real');
+		mkdirSync(realDirectory);
+		const linkPath = join(runtimeRoot, 'linked-allowed');
+		symlinkSync(realDirectory, linkPath);
+		const wrapperPath = join(realDirectory, 'wrapper.cjs');
+		writeFileSync(wrapperPath, "module.exports = require('./addon.node');\n");
+		writeFileSync(join(realDirectory, 'addon.node'), '');
+		require.extensions['.node'] = (module) => {
+			module.exports = { delegated: true };
+		};
+		const result = await scopedImport(wrapperPath, {
+			...vmScope(),
+			runtimeRoot,
+			allowedPath: linkPath,
+		});
+		expect(result.default.delegated).to.equal(true);
 	});
 });
