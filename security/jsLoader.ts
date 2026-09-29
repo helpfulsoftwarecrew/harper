@@ -16,7 +16,7 @@ import { createRequire } from 'node:module';
 import * as env from '../utility/environment/environmentManager';
 import * as child_process from 'node:child_process';
 import { CONFIG_PARAMS, DEFAULT_DATABASE_NAME } from '../utility/hdbTerms.ts';
-
+import { compileSpawnAllowlist, isSpawnAllowed, spawnRefusalMessage } from './spawnGrants.ts';
 import { contentTypes } from '../server/serverHelpers/contentTypes.ts';
 import { markCredentialRejection, credentialRejectionError } from './credentialRejection.ts';
 import type {} from 'ses';
@@ -393,7 +393,7 @@ async function loadModuleWithVM(moduleUrl: string, scope: ApplicationScope, useC
 			}
 			if (resolvedUrl.startsWith('file://')) {
 				if (resolvedUrl.endsWith('.node')) {
-					checkAllowedModulePath(resolvedUrl, scope.allowedPath);
+					checkAllowedModulePath(resolvedUrl, scope);
 					const nativeModule = require(fileURLToPath(resolvedUrl));
 					scope.markNativeRuntime?.();
 					return nativeModule;
@@ -694,7 +694,7 @@ async function loadModuleWithVM(moduleUrl: string, scope: ApplicationScope, useC
 		}
 
 		if (url.startsWith('file://') && usePrivateGlobal) {
-			checkAllowedModulePath(url, scope.allowedPath);
+			checkAllowedModulePath(url, scope);
 			if (url.endsWith('.node')) {
 				const nativeModule = createRequire(url)(fileURLToPath(url));
 				scope.markNativeRuntime?.();
@@ -706,7 +706,7 @@ async function loadModuleWithVM(moduleUrl: string, scope: ApplicationScope, useC
 		}
 
 		// For Node.js built-in modules (node:) and npm packages without application loader for dependency
-		const replacedModule = checkAllowedModulePath(url, scope.allowedPath);
+		const replacedModule = checkAllowedModulePath(url, scope);
 		if (replacedModule) {
 			return createSyntheticModule(url, normalizeImportedModule(replacedModule));
 		}
@@ -759,7 +759,7 @@ async function getCompartment(scope: ApplicationScope, globals) {
 						},
 					};
 				} else if (moduleSpecifier.startsWith('file:') && moduleSpecifier.endsWith('.node')) {
-					checkAllowedModulePath(moduleSpecifier, scope.allowedPath);
+					checkAllowedModulePath(moduleSpecifier, scope);
 					const nativeModule = createRequire(moduleSpecifier)(fileURLToPath(moduleSpecifier));
 					scope.markNativeRuntime?.();
 					const moduleExports = normalizeImportedModule(nativeModule);
@@ -791,7 +791,7 @@ async function getCompartment(scope: ApplicationScope, globals) {
 					}
 					return new StaticModuleRecord(moduleText, moduleSpecifier);
 				} else {
-					checkAllowedModulePath(moduleSpecifier, scope.allowedPath);
+					checkAllowedModulePath(moduleSpecifier, scope);
 					const moduleExports = await import(moduleSpecifier);
 					return {
 						imports: [],
@@ -986,18 +986,37 @@ const ALLOWED_NODE_BUILTIN_MODULES = env.get(CONFIG_PARAMS.APPLICATIONS_ALLOWEDB
 				return true;
 			},
 		};
-const child_processConstrained: any = {
-	exec: createSpawn(child_process.exec),
-	execFile: createSpawn(child_process.execFile),
-	fork: createSpawn(child_process.fork, true), // this is launching node, so deemed safe
-	spawn: createSpawn(child_process.spawn),
-	execSync: function () {
-		throw new Error('execSync is not allowed');
-	},
-};
-child_processConstrained.default = child_processConstrained;
-const REPLACED_BUILTIN_MODULES = {
-	child_process: child_processConstrained,
+interface ConstrainedChildProcess {
+	exec: ReturnType<typeof createSpawn>;
+	execFile: ReturnType<typeof createSpawn>;
+	fork: ReturnType<typeof createSpawn>;
+	spawn: ReturnType<typeof createSpawn>;
+	execSync: () => never;
+	default?: ConstrainedChildProcess;
+}
+const CONSTRAINED_CHILD_PROCESS = new WeakMap<object, ConstrainedChildProcess>();
+const UNSCOPED_KEY = {};
+// Built per scope, because a grant is matched against the scope's component identity.
+function constrainedChildProcess(scope?: ApplicationScope): ConstrainedChildProcess {
+	const key: object = scope ?? UNSCOPED_KEY;
+	let constrained = CONSTRAINED_CHILD_PROCESS.get(key);
+	if (!constrained) {
+		constrained = {
+			exec: createSpawn(child_process.exec, scope),
+			execFile: createSpawn(child_process.execFile, scope),
+			fork: createSpawn(child_process.fork, scope, true), // this is launching node, so deemed safe
+			spawn: createSpawn(child_process.spawn, scope),
+			execSync: () => {
+				throw new Error('execSync is not allowed');
+			},
+		};
+		constrained.default = constrained;
+		CONSTRAINED_CHILD_PROCESS.set(key, constrained);
+	}
+	return constrained;
+}
+const REPLACED_BUILTIN_MODULES: Record<string, (scope?: ApplicationScope) => unknown> = {
+	child_process: constrainedChildProcess,
 };
 /**
  * Creates a ChildProcess-like object for an existing process
@@ -1140,15 +1159,20 @@ function acquirePidFileLock(
 	throw new Error(`Failed to acquire PID file lock after ${maxRetries} attempts`);
 }
 
-function createSpawn(spawnFunction: (...args: any) => child_process.ChildProcess, alwaysAllow?: boolean) {
+function createSpawn(
+	spawnFunction: (...args: any) => child_process.ChildProcess,
+	scope?: ApplicationScope,
+	alwaysAllow?: boolean
+) {
 	return function (command: string, args?: any, options?: any, callback?: (...args: any[]) => void) {
 		// componentLoader imports this module, so it can load before the config is resolved; a value
 		// captured out here would pin an empty allowlist, and an undefined base path, for the life of
 		// the process. Anything but a configured list denies.
 		if (!alwaysAllow) {
 			const allowedCommands = env.get(CONFIG_PARAMS.APPLICATIONS_ALLOWEDSPAWNCOMMANDS);
-			if (!Array.isArray(allowedCommands) || !allowedCommands.includes(command.split(' ')[0])) {
-				throw new Error(`Command ${command} is not allowed`);
+			// A string is iterable, so without the Array.isArray test `npm` would admit a command named `n`.
+			if (!Array.isArray(allowedCommands) || !isSpawnAllowed(command, compileSpawnAllowlist(allowedCommands), scope)) {
+				throw new Error(spawnRefusalMessage(command, scope));
 			}
 		}
 		const processName = options?.name;
@@ -1208,11 +1232,12 @@ function createSpawn(spawnFunction: (...args: any) => child_process.ChildProcess
  * For node built-in modules, checks against an allowlist and returns any replacements.
  *
  * @param {string} moduleUrl - The URL or identifier of the module to be loaded, which may be a file: URL, node: URL, or bare module specifier.
- * @param {string} allowedPath - The absolute path that the module is allowed to load from.
- * @return {any} Returns undefined for allowed file paths, or a replacement module identifier for allowed node built-in modules.
+ * @param {ApplicationScope} scope - The loading scope, supplying the allowed path and the component identity a replacement module is built for.
+ * @return {unknown} Returns undefined for allowed file paths, or a replacement module for allowed node built-in modules.
  * @throws {Error} Throws an error if the module is outside the allowed path or if the module is not in the allowed list.
  */
-function checkAllowedModulePath(moduleUrl: string, allowedPath?: string): boolean {
+function checkAllowedModulePath(moduleUrl: string, scope?: ApplicationScope): unknown {
+	const allowedPath = scope?.allowedPath;
 	if (moduleUrl.startsWith('file:')) {
 		let path = fileURLToPath(moduleUrl);
 		try {
@@ -1225,7 +1250,7 @@ function checkAllowedModulePath(moduleUrl: string, allowedPath?: string): boolea
 	}
 	let simpleName = moduleUrl.startsWith('node:') ? moduleUrl.slice(5) : moduleUrl;
 	simpleName = simpleName.split('/')[0];
-	if (ALLOWED_NODE_BUILTIN_MODULES.has(simpleName)) return REPLACED_BUILTIN_MODULES[simpleName];
+	if (ALLOWED_NODE_BUILTIN_MODULES.has(simpleName)) return REPLACED_BUILTIN_MODULES[simpleName]?.(scope);
 	throw new Error(`Module ${moduleUrl} is not allowed to be imported`);
 }
 

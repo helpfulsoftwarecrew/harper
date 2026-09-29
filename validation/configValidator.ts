@@ -12,6 +12,7 @@ import * as hdbTerms from '../utility/hdbTerms.ts';
 import { getDomainSocketPathMaxBytes } from '../utility/domainSocket.ts';
 import { bareHostViolation } from '../utility/nodeIdentity.ts';
 import { parseMaxSize } from '../utility/logging/logRotation.ts';
+import { grantPathProblem } from '../security/spawnGrants.ts';
 import * as validator from './validationWrapper.ts';
 
 const DEFAULT_LOG_FOLDER = 'log';
@@ -98,6 +99,11 @@ const routeEntryConstraints = Joi.alternatives([
 		excludeTables: array.items(string),
 	},
 ]);
+// The whole config is validated with allowUnknown, so a grant turns it off to reject unknown keys.
+const spawnGrantConstraints = Joi.object({
+	component: string.required(),
+	path: string.required().custom(validateSpawnGrantPath),
+}).options({ allowUnknown: false });
 const replicatesConstraints = Joi.alternatives([
 	boolean,
 	{
@@ -381,6 +387,14 @@ export function configValidator(configJson, skipFsValidation = false) {
 			}),
 			boolean
 		).optional(),
+		applications: Joi.object({
+			allowedSpawnCommands: array
+				.items(Joi.alternatives([string, spawnGrantConstraints]))
+				.optional()
+				.empty(null),
+		})
+			.unknown(true)
+			.optional(),
 		analytics: Joi.object({
 			aggregatePeriod: number,
 			replicate: boolean.optional(),
@@ -598,6 +612,13 @@ function validateNodeUrl(value, helpers) {
 		return value; // unparseable — skipped at runtime, not worth failing the boot over
 	}
 	if (!host) return helpers.message('{{#label}} must be a URL with a host (e.g. "wss://node1.example.com:9933")');
+	return value;
+}
+
+// The rule grant compilation applies too: a grant path stays under its component's directory.
+function validateSpawnGrantPath(value, helpers) {
+	const problem = grantPathProblem(value);
+	if (problem) return helpers.message(`{{#label}} ${problem}`);
 	return value;
 }
 

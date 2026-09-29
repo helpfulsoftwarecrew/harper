@@ -1407,4 +1407,64 @@ describe('Test configValidator module', () => {
 			});
 		});
 	});
+
+	describe('applications.allowedSpawnCommands config', () => {
+		const GRANT = {
+			component: 'my-component',
+			path: 'node_modules/@example/agent-*/bin/agent',
+		};
+		const withSpawnCommands = (allowedSpawnCommands) => {
+			const config = testUtils.deepClone(FAKE_CONFIG);
+			config.applications = { allowedSpawnCommands };
+			return configValidator(config, true);
+		};
+
+		it('validates clean when the applications block is absent', () => {
+			const result = configValidator(testUtils.deepClone(FAKE_CONFIG), true);
+			expect(result.error).to.be.undefined;
+		});
+
+		it('accepts the shipped string defaults unchanged', () => {
+			const result = withSpawnCommands(['npm', 'node']);
+			expect(result.error).to.be.undefined;
+			expect(result.value.applications.allowedSpawnCommands).to.deep.equal(['npm', 'node']);
+		});
+
+		it('accepts a component-relative grant beside the strings', () => {
+			const result = withSpawnCommands(['npm', 'node', GRANT]);
+			expect(result.error).to.be.undefined;
+			expect(result.value.applications.allowedSpawnCommands[2]).to.deep.equal(GRANT);
+		});
+
+		it('leaves the rest of the applications block unvalidated', () => {
+			const config = testUtils.deepClone(FAKE_CONFIG);
+			config.applications = { moduleLoader: 'vm-currnet-context', allowedSpawnCommands: ['npm'] };
+			expect(configValidator(config, true).error).to.be.undefined;
+		});
+
+		it('rejects a grant path that is absolute or has a "." or ".." segment', () => {
+			for (const badPath of ['../other/bin/tool', 'bin/../../other/tool', '/usr/bin/tool', './bin/tool']) {
+				const result = withSpawnCommands([{ ...GRANT, path: badPath }]);
+				expect(result.error, badPath).to.not.be.undefined;
+				expect(result.error.message, badPath).to.include('applications.allowedSpawnCommands');
+			}
+		});
+
+		it('rejects a grant with no component', () => {
+			const result = withSpawnCommands([{ path: GRANT.path }]);
+			expect(result.error).to.not.be.undefined;
+			expect(result.error.message).to.include('component');
+		});
+
+		it('rejects an unknown key on a grant', () => {
+			const result = withSpawnCommands([{ ...GRANT, allow: true }]);
+			expect(result.error).to.not.be.undefined;
+			expect(result.error.message).to.include('allow');
+		});
+
+		it('rejects a non-string, non-object entry', () => {
+			const result = withSpawnCommands([42]);
+			expect(result.error).to.not.be.undefined;
+		});
+	});
 });

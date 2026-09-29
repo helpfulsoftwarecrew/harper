@@ -9,6 +9,37 @@
 			"type": "string",
 			"description": "Root folder where Harper persists data, config, logs, and components. Default: user's home directory"
 		},
+		"applications": {
+			"type": "object",
+			"description": "Component loading configuration.",
+			"additionalProperties": true,
+			"properties": {
+				"allowedSpawnCommands": {
+					"type": "array",
+					"description": "Commands components are allowed to spawn. A string matches the first token of the command exactly; an object grants a path under one named component's own directory.",
+					"items": {
+						"oneOf": [
+							{ "type": "string" },
+							{
+								"type": "object",
+								"additionalProperties": false,
+								"required": ["component", "path"],
+								"properties": {
+									"component": {
+										"type": "string",
+										"description": "Component directory name the grant applies to."
+									},
+									"path": {
+										"type": "string",
+										"description": "Path relative to that component's directory. '*' matches within a single path segment."
+									}
+								}
+							}
+						]
+					}
+				}
+			}
+		},
 		"componentsRoot": {
 			"type": "string",
 			"description": "Path to the folder containing local component files. Default: <ROOTPATH>/components"
