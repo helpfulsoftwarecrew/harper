@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { readdirSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 
 import harperLogger from '../../utility/logging/harper_logger.ts';
@@ -28,12 +28,12 @@ export function resolvePreloadModules(
 	const anchors = getResolutionAnchors(componentsRoot);
 	const resolved: string[] = [];
 	for (const specifier of specifiers) {
-		const path = resolveSpecifier(specifier, anchors);
+		const path = resolveSpecifier(specifier, anchors) ?? resolveComponentKeySpecifier(specifier, componentsRoot);
 		if (path) resolved.push(path);
 		else
 			harperLogger.warn(
 				`Could not resolve ${configKey} module "${specifier}"; it will not be preloaded. It must be an ` +
-					`absolute path or a package installed in a deployed component.`
+					`absolute path, a package installed in a deployed component, or a component's config key.`
 			);
 	}
 	if (resolved.length > 0) harperLogger.trace(`Preloading modules on worker threads: ${resolved.join(', ')}`);
@@ -79,4 +79,32 @@ function resolveSpecifier(specifier: string, anchors: string[]): string | undefi
 		}
 	}
 	return undefined;
+}
+
+// Fallback: the first segment may be a component's config key (its install folder under `componentsRoot`).
+function resolveComponentKeySpecifier(specifier: string, componentsRoot: string | undefined): string | undefined {
+	if (!componentsRoot) return undefined;
+	const slash = specifier.indexOf('/');
+	const key = slash === -1 ? specifier : specifier.slice(0, slash);
+	if (key.length === 0 || key.startsWith('.')) return undefined;
+	const componentDir = join(componentsRoot, key);
+	let packageName: unknown;
+	let exportsMap: unknown;
+	try {
+		({ name: packageName, exports: exportsMap } = JSON.parse(readFileSync(join(componentDir, 'package.json'), 'utf8')));
+	} catch {
+		return undefined; // no installed component under this key
+	}
+	const componentRequire = createRequire(join(componentDir, 'index.js'));
+	try {
+		// Without an `exports` map Node allows no self-reference and hides no file, so resolve by path.
+		if (exportsMap == null) {
+			return componentRequire.resolve(slash === -1 ? componentDir : join(componentDir, specifier.slice(slash + 1)));
+		}
+		// Self-reference applies the `exports` map, refusing an unexported subpath as the package name does.
+		if (typeof packageName !== 'string' || packageName.length === 0) return undefined;
+		return componentRequire.resolve(slash === -1 ? packageName : packageName + specifier.slice(slash));
+	} catch {
+		return undefined;
+	}
 }
