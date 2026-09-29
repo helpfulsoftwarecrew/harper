@@ -13,6 +13,7 @@ import { ApplicationScope } from '../components/ApplicationScope.ts';
 import { getSecretsForComponent, runWithComponentBinding } from '../components/componentSecrets.ts';
 import logger from '../utility/logging/harper_logger.ts';
 import { createRequire } from 'node:module';
+import { getPriority } from 'node:os';
 import * as env from '../utility/environment/environmentManager';
 import * as child_process from 'node:child_process';
 import { CONFIG_PARAMS, DEFAULT_DATABASE_NAME } from '../utility/hdbTerms.ts';
@@ -1012,14 +1013,10 @@ class ExistingProcessWrapper extends EventEmitter {
 
 		// Monitor process and emit exit event when it terminates
 		this.checkInterval = setInterval(() => {
-			try {
-				// Signal 0 checks if process exists without actually killing it
-				process.kill(pid, 0);
-			} catch {
-				// Process no longer exists
-				clearInterval(this.checkInterval);
-				this.emit('exit', null, null);
-			}
+			// kill(pid, 0) alone accepts a zombie: a child that dies after its spawning thread has ended.
+			if (isProcessRunning(pid)) return;
+			clearInterval(this.checkInterval);
+			this.emit('exit', null, null);
 		}, 1000);
 	}
 
@@ -1047,24 +1044,169 @@ function isProcessRunning(pid: number): boolean {
 	try {
 		// Signal 0 checks existence without killing
 		process.kill(pid, 0);
-		return true;
+		return !isZombie(pid);
 	} catch {
 		return false;
 	}
 }
 
 /**
+ * Only the event loop that spawned a child reaps it, so a child outliving its worker thread dies as a
+ * zombie, which kill(pid, 0) still finds. Windows has none.
+ */
+function isZombie(pid: number): boolean {
+	try {
+		if (process.platform === 'linux') return procStatFields(pid)[0] === 'Z';
+		if (process.platform === 'darwin') {
+			// On macOS getpriority(2) refuses a zombie, which kill(pid, 0) accepts; ps confirms only a refusal.
+			try {
+				getPriority(pid);
+				return false;
+			} catch {
+				const state = child_process.execFileSync('ps', ['-o', 'state=', '-p', String(pid)], {
+					encoding: 'utf-8',
+					timeout: 2000,
+					stdio: ['ignore', 'pipe', 'ignore'],
+				});
+				return state.trim().startsWith('Z');
+			}
+		}
+	} catch {
+		// Exited before the read, or unreadable: the kill(pid, 0) answer stands.
+	}
+	return false;
+}
+
+/** The fields of /proc/<pid>/stat after the parenthesized comm, which can hold spaces: state is [0], starttime [19]. */
+function procStatFields(pid: number): string[] {
+	const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+	return stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+}
+
+/**
  * Acquires an exclusive lock using the PID file itself (synchronously with busy-wait)
  * Returns 0 if lock was acquired (need to spawn new process), or the existing PID if process is running
  */
-function parsePidFile(content: string): { pid: number; version: number } {
+export function parsePidFile(content: string): { pid: number; version: number; started: string | null } {
 	const lines = content.trim().split('\n');
 	const pid = Number.parseInt(lines[0], 10);
 	const version = lines.length > 1 ? parseInt(lines[1], 10) : 0;
-	return { pid, version };
+	// Line 3 records when the process started; a file without one identifies nothing.
+	return { pid, version, started: lines[2]?.trim() || null };
 }
 
-function acquirePidFileLock(
+/** Linux's boot id and the start tick from /proc/<pid>/stat, which a recycled pid or a reboot cannot repeat. */
+function linuxStart(pid: number): string | null {
+	try {
+		const startTicks = procStatFields(pid)[19];
+		if (!startTicks) return null;
+		let bootId = '';
+		try {
+			bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf-8').trim();
+		} catch {
+			// Without a boot id the start tick still tells a recycled pid apart within one boot.
+		}
+		return `${bootId}:${startTicks}`;
+	} catch {
+		return null;
+	}
+}
+
+/** When the process holding `pid` started, in epoch ms, on macOS and Windows; null where it cannot be read. */
+function startedAt(pid: number): number | null {
+	try {
+		if (process.platform === 'darwin') {
+			const out = child_process.execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+				encoding: 'utf-8',
+				timeout: 2000,
+				// A pid ps refuses is an answer, not something to print on the node's stderr.
+				stdio: ['ignore', 'pipe', 'ignore'],
+				env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
+			});
+			const started = Date.parse(`${out.trim()} UTC`);
+			return Number.isNaN(started) ? null : started;
+		}
+		if (process.platform === 'win32') {
+			const out = child_process.execFileSync(
+				'powershell.exe',
+				[
+					'-NoProfile',
+					'-NonInteractive',
+					'-Command',
+					`$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}'; ` +
+						'if ($p.CreationDate) { [DateTimeOffset]::new($p.CreationDate).ToUnixTimeMilliseconds() }',
+				],
+				{ encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }
+			);
+			const started = Number.parseInt(out.trim(), 10);
+			return Number.isFinite(started) ? started : null;
+		}
+	} catch {
+		// A process that exited before the read, or a platform that refuses.
+	}
+	return null;
+}
+
+// Date.now() and a reported start time read one system clock; this covers the resolution between them.
+const START_CLOCK_SKEW_MS = 50;
+
+/**
+ * What the pid file records on line 3 for a process just spawned. Off Linux a start time means running `ps`
+ * or PowerShell while the lock file is still empty, so the file records a moment the process was running.
+ */
+export function spawnRecord(pid: number): string {
+	return process.platform === 'linux' ? (linuxStart(pid) ?? '') : String(Date.now());
+}
+
+/**
+ * Whether the process holding `pid` is the one `recorded` describes. Only a positive match is true; a
+ * missing record or a start time the platform cannot report is false.
+ */
+export function processMatches(pid: number, recorded: string | null): boolean {
+	if (!recorded) return false;
+	if (process.platform === 'linux') return linuxStart(pid) === recorded;
+	// A recycled pid started after the original was known to be running.
+	const started = startedAt(pid);
+	const knownAt = Number(recorded);
+	return started !== null && Number.isFinite(knownAt) && started <= knownAt + START_CLOCK_SKEW_MS;
+}
+
+// A thread holds the removal guard for a few file calls; one this old was left by a thread that died.
+const PID_FILE_GUARD_STALE_MS = 2000;
+
+/**
+ * Unlinks the pid file only while it still holds `judged` and is at least `minAgeMs` old, under a guard
+ * file, so a lock another thread took after the judgment survives.
+ */
+export function removeStalePidFile(pidFilePath: string, judged: string, minAgeMs = 0): boolean {
+	const guard = `${pidFilePath}.lock`;
+	try {
+		closeSync(openSync(guard, 'wx'));
+	} catch {
+		try {
+			if (Date.now() - statSync(guard).mtimeMs >= PID_FILE_GUARD_STALE_MS) unlinkSync(guard);
+		} catch {
+			// Released meanwhile; the caller's retry takes it.
+		}
+		return false;
+	}
+	try {
+		if (readFileSync(pidFilePath, 'utf-8') !== judged) return false;
+		if (minAgeMs > 0 && Date.now() - statSync(pidFilePath).mtimeMs < minAgeMs) return false;
+		unlinkSync(pidFilePath);
+		return true;
+	} catch {
+		return false;
+	} finally {
+		try {
+			unlinkSync(guard);
+		} catch {
+			// Broken as abandoned by another thread; nothing left to release.
+		}
+	}
+}
+
+export function acquirePidFileLock(
 	pidFilePath: string,
 	requestedVersion?: number,
 	maxRetries = 100,
@@ -1081,9 +1223,21 @@ function acquirePidFileLock(
 				// File exists - check if it contains a valid running process
 				try {
 					const pidContent = readFileSync(pidFilePath, 'utf-8');
-					const { pid: existingPid, version: existingVersion } = parsePidFile(pidContent);
+					const { pid: existingPid, version: existingVersion, started } = parsePidFile(pidContent);
+					const running = !isNaN(existingPid) && isProcessRunning(existingPid);
 
-					if (!isNaN(existingPid) && isProcessRunning(existingPid)) {
+					// Pids are reissued on restart, so a live pid can be a stranger, on Linux even a thread of
+					// this process. A start other than the recorded one makes the file stale.
+					if (running && !processMatches(existingPid, started)) {
+						removeStalePidFile(pidFilePath, pidContent);
+						const staleStart = Date.now();
+						while (Date.now() - staleStart < retryDelay) {
+							// Busy wait, matching the other retry paths in this loop.
+						}
+						continue;
+					}
+
+					if (running) {
 						// If the version isn't the one we want, kill the existing process and re-acquire
 						if (requestedVersion != null && requestedVersion !== existingVersion) {
 							try {
@@ -1091,11 +1245,7 @@ function acquirePidFileLock(
 							} catch {
 								// Process may have already exited
 							}
-							try {
-								unlinkSync(pidFilePath);
-							} catch {
-								// Another thread may have removed it
-							}
+							removeStalePidFile(pidFilePath, pidContent);
 							// Retry to acquire the lock for the new version
 							const start = Date.now();
 							while (Date.now() - start < retryDelay) {
@@ -1116,11 +1266,7 @@ function acquirePidFileLock(
 						// Just wait and retry, don't try to remove
 					} else {
 						// Stale PID file (old and invalid), try to remove it
-						try {
-							unlinkSync(pidFilePath);
-						} catch {
-							// Another thread may have removed it, retry
-						}
+						removeStalePidFile(pidFilePath, pidContent, 100);
 					}
 				} catch {
 					// Couldn't read/stat file, another thread might be modifying it, retry
@@ -1140,7 +1286,7 @@ function acquirePidFileLock(
 	throw new Error(`Failed to acquire PID file lock after ${maxRetries} attempts`);
 }
 
-function createSpawn(spawnFunction: (...args: any) => child_process.ChildProcess, alwaysAllow?: boolean) {
+export function createSpawn(spawnFunction: (...args: any) => child_process.ChildProcess, alwaysAllow?: boolean) {
 	return function (command: string, args?: any, options?: any, callback?: (...args: any[]) => void) {
 		// componentLoader imports this module, so it can load before the config is resolved; a value
 		// captured out here would pin an empty allowlist, and an undefined base path, for the life of
@@ -1175,9 +1321,8 @@ function createSpawn(spawnFunction: (...args: any) => child_process.ChildProcess
 		// We acquired the lock (file was created), spawn new process
 		const childProcess = spawnFunction(command, args, options, callback);
 
-		// Write PID (and version if provided) to the file we just created
-		const pidFileContent =
-			requestedVersion != null ? `${childProcess.pid}\n${requestedVersion}` : childProcess.pid.toString();
+		// Write the pid, the version and the start a later boot identifies this process by.
+		const pidFileContent = `${childProcess.pid}\n${requestedVersion ?? 0}\n${spawnRecord(childProcess.pid)}`;
 		try {
 			writeFileSync(pidFilePath, pidFileContent, 'utf-8');
 		} catch (err) {
