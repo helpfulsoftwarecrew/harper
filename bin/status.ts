@@ -10,6 +10,7 @@ import * as systemInformation from '../utility/environment/systemInformation.ts'
 import * as envMgr from '../utility/environment/environmentManager.ts';
 import * as installation from '../utility/installation.ts';
 import { prettyDuration } from '../utility/common_utils.ts';
+import { staleHdbPidReason } from '../utility/processManagement/processManagement.js';
 envMgr.initSync();
 
 const STATUSES = {
@@ -70,7 +71,8 @@ async function status() {
 	// Check the saved pid against any running hdb processes
 	const hdbSysInfo = await systemInformation.getHDBProcessInfo();
 	for (const proc of hdbSysInfo.core) {
-		if (proc.pid === hdbPid) {
+		// Stale once the holder is identified as something else; an unidentified one reads as running, as harper run reads it
+		if (proc.pid === hdbPid && staleHdbPidReason(hdbPid) === null) {
 			status.harperdb.status = STATUSES.RUNNING;
 			status.harperdb.pid = hdbPid;
 			// `status` is a separate short-lived CLI process, so `process.uptime()` would report its own

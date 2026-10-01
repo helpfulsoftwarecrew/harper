@@ -9,8 +9,12 @@ const fs = require('fs');
 const path = require('node:path');
 const { setTimeout: delay } = require('node:timers/promises');
 const { execFile, fork } = require('node:child_process');
+const { executableOf, isProcessAlive } = require('./processIdentity.js');
 
 const INIT_PROCESS_NAMES = new Set(['catatonit', 'docker-init', 'dumb-init', 'init', 's6-svscan', 'systemd', 'tini']);
+// Every runtime a Harper main process can be: a live holder is stale only once identified as none of these
+const RUNTIME_PROCESS_NAMES = new Set(['bun', 'harper', 'node', 'nodejs']);
+const NOT_RUNNING = 'is not running';
 
 module.exports = {
 	start,
@@ -18,6 +22,7 @@ module.exports = {
 	kill,
 	startService,
 	getHdbPid,
+	staleHdbPidReason,
 	isProcessRunning,
 	cleanupChildrenProcesses,
 	expectedRestartOfChildren,
@@ -122,10 +127,33 @@ function getHdbPid() {
 	const pidFile = path.join(harperPath, hdbTerms.HDB_PID_FILE);
 	const hdbPid = readPidFile(pidFile);
 	if (!hdbPid || hdbPid === process.pid) return;
+	const staleReason = staleHdbPidReason(hdbPid);
+	// A live runtime process, or one this platform cannot identify: refusing keeps two nodes from racing
+	if (staleReason === null) return hdbPid;
+	if (staleReason !== NOT_RUNNING) hdbLogger.warn(`Ignoring stale pid file ${pidFile}: pid ${hdbPid} ${staleReason}`);
+}
+
+/** Why a pid read from hdb.pid is not a Harper still up, or null when it may be one. A live holder this platform
+ * cannot identify gets null, so run, stop and status all treat it as Harper. */
+function staleHdbPidReason(pid) {
 	// A persistent volume from an older image may contain PID 1 after the current image puts an init at that PID.
-	if (hdbPid === 1 && isInitProcess(hdbPid)) return;
-	if (isProcessRunning(hdbPid)) return hdbPid;
-	// return undefined
+	if (pid === 1 && isInitProcess(pid)) return 'is the init process, not Harper';
+	// Zombie-aware on Linux and darwin, unlike bare kill(pid, 0): a dead-but-unreaped holder is not an earlier Harper still up
+	if (!isProcessAlive(pid)) return NOT_RUNNING;
+	const executable = executableOf(pid);
+	if (executable !== null && !isRuntimeExecutable(executable)) return `is running ${executable}, not Harper`;
+	return null;
+}
+
+// A holder running any known runtime, or a path resolving to this process's own binary, may be a Harper
+function isRuntimeExecutable(executable) {
+	if (RUNTIME_PROCESS_NAMES.has(path.basename(executable).toLowerCase())) return true;
+	try {
+		return fs.realpathSync(executable) === fs.realpathSync(process.execPath);
+	} catch {
+		// Unresolvable, as a bare name from darwin's ps usually is: not shown to be this process's binary
+		return false;
+	}
 }
 
 function isInitProcess(pid) {
