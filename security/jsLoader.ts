@@ -12,26 +12,15 @@ import { SourceTextModule, SyntheticModule, createContext, runInContext, runInTh
 import { ApplicationScope } from '../components/ApplicationScope.ts';
 import { getSecretsForComponent, runWithComponentBinding } from '../components/componentSecrets.ts';
 import logger from '../utility/logging/harper_logger.ts';
+import { child_processConstrained } from './processSupervisor/constrainedChildProcess.ts';
 import { createRequire } from 'node:module';
 import * as env from '../utility/environment/environmentManager';
-import * as child_process from 'node:child_process';
 import { CONFIG_PARAMS, DEFAULT_DATABASE_NAME } from '../utility/hdbTerms.ts';
 
 import { contentTypes } from '../server/serverHelpers/contentTypes.ts';
 import { markCredentialRejection, credentialRejectionError } from './credentialRejection.ts';
 import type {} from 'ses';
-import {
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	writeFileSync,
-	unlinkSync,
-	openSync,
-	closeSync,
-	statSync,
-	realpathSync,
-} from 'node:fs';
-import { EventEmitter } from 'node:events';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { whenComponentsLoaded, bootLoadsComponents } from '../server/threads/threadServer.js';
 import { thisThreadOwnsApplication } from '../server/threads/isolatedApplications.ts';
 
@@ -986,221 +975,10 @@ const ALLOWED_NODE_BUILTIN_MODULES = env.get(CONFIG_PARAMS.APPLICATIONS_ALLOWEDB
 				return true;
 			},
 		};
-const child_processConstrained: any = {
-	exec: createSpawn(child_process.exec),
-	execFile: createSpawn(child_process.execFile),
-	fork: createSpawn(child_process.fork, true), // this is launching node, so deemed safe
-	spawn: createSpawn(child_process.spawn),
-	execSync: function () {
-		throw new Error('execSync is not allowed');
-	},
-};
-child_processConstrained.default = child_processConstrained;
+// Bound by name: constrainedChildProcess.ts exports the allowlisted, PID-locked object under exactly this identifier
 const REPLACED_BUILTIN_MODULES = {
 	child_process: child_processConstrained,
 };
-/**
- * Creates a ChildProcess-like object for an existing process
- */
-class ExistingProcessWrapper extends EventEmitter {
-	pid: number;
-	private checkInterval: NodeJS.Timeout;
-
-	constructor(pid: number) {
-		super();
-		this.pid = pid;
-
-		// Monitor process and emit exit event when it terminates
-		this.checkInterval = setInterval(() => {
-			try {
-				// Signal 0 checks if process exists without actually killing it
-				process.kill(pid, 0);
-			} catch {
-				// Process no longer exists
-				clearInterval(this.checkInterval);
-				this.emit('exit', null, null);
-			}
-		}, 1000);
-	}
-
-	// Kill the process
-	kill(signal?: NodeJS.Signals | number) {
-		try {
-			process.kill(this.pid, signal);
-			return true;
-		} catch {
-			return false;
-		}
-	}
-
-	// Clean up interval when wrapper is no longer needed
-	unref() {
-		clearInterval(this.checkInterval);
-		return this;
-	}
-}
-
-/**
- * Checks if a process with the given PID is running
- */
-function isProcessRunning(pid: number): boolean {
-	try {
-		// Signal 0 checks existence without killing
-		process.kill(pid, 0);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-/**
- * Acquires an exclusive lock using the PID file itself (synchronously with busy-wait)
- * Returns 0 if lock was acquired (need to spawn new process), or the existing PID if process is running
- */
-function parsePidFile(content: string): { pid: number; version: number } {
-	const lines = content.trim().split('\n');
-	const pid = Number.parseInt(lines[0], 10);
-	const version = lines.length > 1 ? parseInt(lines[1], 10) : 0;
-	return { pid, version };
-}
-
-function acquirePidFileLock(
-	pidFilePath: string,
-	requestedVersion?: number,
-	maxRetries = 100,
-	retryDelay = 5
-): { pid: number; version: number } {
-	for (let attempt = 0; attempt < maxRetries; attempt++) {
-		try {
-			// Try to open exclusively - 'wx' fails if file exists
-			const fd = openSync(pidFilePath, 'wx');
-			closeSync(fd);
-			return { pid: 0, version: 0 }; // Successfully acquired lock (file created), caller should spawn process
-		} catch (err) {
-			if (err.code === 'EEXIST') {
-				// File exists - check if it contains a valid running process
-				try {
-					const pidContent = readFileSync(pidFilePath, 'utf-8');
-					const { pid: existingPid, version: existingVersion } = parsePidFile(pidContent);
-
-					if (!isNaN(existingPid) && isProcessRunning(existingPid)) {
-						// If the version isn't the one we want, kill the existing process and re-acquire
-						if (requestedVersion != null && requestedVersion !== existingVersion) {
-							try {
-								process.kill(existingPid);
-							} catch {
-								// Process may have already exited
-							}
-							try {
-								unlinkSync(pidFilePath);
-							} catch {
-								// Another thread may have removed it
-							}
-							// Retry to acquire the lock for the new version
-							const start = Date.now();
-							while (Date.now() - start < retryDelay) {
-								// Busy wait for process cleanup
-							}
-							continue;
-						}
-						// Valid process is running at same or higher version, return its PID
-						return { pid: existingPid, version: existingVersion };
-					}
-
-					// Invalid/empty PID - check file age to determine if it's stale or being written
-					const stats = statSync(pidFilePath);
-					const fileAge = Date.now() - stats.mtimeMs;
-
-					// If file is very new (less than 100ms) and empty/invalid, another thread is likely still writing to it
-					if (fileAge < 100) {
-						// Just wait and retry, don't try to remove
-					} else {
-						// Stale PID file (old and invalid), try to remove it
-						try {
-							unlinkSync(pidFilePath);
-						} catch {
-							// Another thread may have removed it, retry
-						}
-					}
-				} catch {
-					// Couldn't read/stat file, another thread might be modifying it, retry
-				}
-
-				// Wait a bit before retrying
-				const start = Date.now();
-				while (Date.now() - start < retryDelay) {
-					// Busy wait
-				}
-			} else {
-				throw err;
-			}
-		}
-	}
-
-	throw new Error(`Failed to acquire PID file lock after ${maxRetries} attempts`);
-}
-
-function createSpawn(spawnFunction: (...args: any) => child_process.ChildProcess, alwaysAllow?: boolean) {
-	return function (command: string, args?: any, options?: any, callback?: (...args: any[]) => void) {
-		// componentLoader imports this module, so it can load before the config is resolved; a value
-		// captured out here would pin an empty allowlist, and an undefined base path, for the life of
-		// the process. Anything but a configured list denies.
-		if (!alwaysAllow) {
-			const allowedCommands = env.get(CONFIG_PARAMS.APPLICATIONS_ALLOWEDSPAWNCOMMANDS);
-			if (!Array.isArray(allowedCommands) || !allowedCommands.includes(command.split(' ')[0])) {
-				throw new Error(`Command ${command} is not allowed`);
-			}
-		}
-		const processName = options?.name;
-		if (!processName)
-			throw new Error(
-				`Calling ${spawnFunction.name} in Harper must have a process "name" in the options to ensure that a single process is started and reused`
-			);
-		const requestedVersion = options?.version;
-
-		// Ensure PID directory exists
-		const pidDir = join(env.getHdbBasePath(), 'pids');
-		mkdirSync(pidDir, { recursive: true });
-
-		const pidFilePath = join(pidDir, `${processName}.pid`);
-
-		// Try to acquire lock - returns pid: 0 if acquired, or existing PID/version
-		const existing = acquirePidFileLock(pidFilePath, requestedVersion);
-
-		if (existing.pid !== 0) {
-			// Existing process is running, return wrapper
-			return new ExistingProcessWrapper(existing.pid);
-		}
-
-		// We acquired the lock (file was created), spawn new process
-		const childProcess = spawnFunction(command, args, options, callback);
-
-		// Write PID (and version if provided) to the file we just created
-		const pidFileContent =
-			requestedVersion != null ? `${childProcess.pid}\n${requestedVersion}` : childProcess.pid.toString();
-		try {
-			writeFileSync(pidFilePath, pidFileContent, 'utf-8');
-		} catch (err) {
-			// Failed to write PID, clean up
-			try {
-				childProcess.kill();
-				unlinkSync(pidFilePath);
-			} catch {}
-			throw err;
-		}
-
-		// Clean up PID file when process exits
-		childProcess.on('exit', () => {
-			try {
-				unlinkSync(pidFilePath);
-			} catch {
-				// File may already be removed
-			}
-		});
-
-		return childProcess;
-	};
-}
 
 /**
  * Validates whether a module can be loaded based on security restrictions and returns the module path or replacement.

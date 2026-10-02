@@ -136,6 +136,15 @@ Index of the design notes for the harper core: one line per note, grouped by the
 - [Authentication converts every principal-resolution failure into a decision (`security/auth.ts`)](security/DESIGN.md#authentication-converts-every-principal-resolution-failure-into-a-decision-securityauthts) — A failed `server.getUser` becomes an in-place 401 or a deferred rejection, never a throw; an in-place answer must be recorded or a WebSocket/MQTT upgrade proceeds with no principal.
 - [User and role lookups read the records, and nothing derived from them outlives them (`security/user.ts`)](security/DESIGN.md#user-and-role-lookups-read-the-records-and-nothing-derived-from-them-outlives-them-securityuserts) — No per-thread copy and no change broadcast; derived data and cached principals are validated against entry versions.
 
+## security/processSupervisor/ — sidecar lifecycle (`scope.processes`)
+
+- [What a component author writes](security/processSupervisor/DESIGN.md#what-a-component-author-writes) — The descriptor `scope.processes.start()` takes and the state it resolves to.
+- [What start() does, in order](security/processSupervisor/DESIGN.md#what-start-does-in-order) — Config writes, the identity-checked PID lock, the recorded descriptor, the reaper, then verify.
+- [The keeper](security/processSupervisor/DESIGN.md#the-keeper) — On Linux and darwin a double-forked keeper starts each process, reaps it, restarts a crash and records every death, so none of that needs the thread that started it.
+- [The one signalling rule](security/processSupervisor/DESIGN.md#the-one-signalling-rule) — Nothing signals a pid it has not positively identified, outside named platform fallbacks; "not ours" and "cannot tell" both forbid it.
+- [Shutdown and the deaths shutdown never sees](security/processSupervisor/DESIGN.md#shutdown-and-the-deaths-shutdown-never-sees) — A graceful exit stops sidecars from the main process; a detached reaper covers SIGKILL.
+- [Invariants worth keeping](security/processSupervisor/DESIGN.md#invariants-worth-keeping) — One process per `name` per node, and one respawner per death: the keeper where there is one.
+
 ## components/ — deploys and the load lifecycle
 
 - [A deploy builds off to the side, is validated, and only then goes live](components/DESIGN.md#a-deploy-builds-off-to-the-side-is-validated-and-only-then-goes-live) — A deploy builds in `.deploy-staging`, validates that tree, then swaps live to `.deploy-aside` and the candidate in, waiting out handle holders with the old version in place; the component's root-config entry is journaled with the activation and published durably, under one lock, only after the swap commits; the release it displaces goes back under its own deployment id, which `deployment_id` activates again, and activating the id already live answers without a swap.

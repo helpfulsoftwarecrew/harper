@@ -31,6 +31,7 @@ import { ensureCertificateVerificationTables } from '../security/certificateVeri
 import { getThisNodeName, getThisNodeHostname } from '../server/nodeName.ts';
 import * as hdbTerms from '../utility/hdbTerms.ts';
 import { getHdbPid, isProcessRunning } from '../utility/processManagement/processManagement.js';
+import { stopSidecarsAtExit } from '../security/processSupervisor/sidecarRegistry.ts';
 import { PACKAGE_ROOT } from '../utility/packageUtils.js';
 
 let pmUtils;
@@ -61,12 +62,15 @@ function addExitListeners() {
 			}
 		};
 		// Forward defence, not load-bearing today: nothing below can reach a worker start.
+		// Before removeHdbPid: the stop acts only while hdb.pid names this process, and `harper restart` removes it first
 		process.on('exit', () => {
 			beginProcessShutdown();
+			stopSidecarsAtExit();
 			removeHdbPid();
 		});
 		const exit = () => {
 			beginProcessShutdown();
+			stopSidecarsAtExit();
 			removeHdbPid();
 			process.exit(0);
 		};

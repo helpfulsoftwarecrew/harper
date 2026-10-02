@@ -21,6 +21,7 @@ import {
 import type { SecretsView } from './componentSecrets.ts';
 import { deployLifecycle } from './deployLifecycle.ts';
 import { thisThreadOwnsApplication } from '../server/threads/isolatedApplications.ts';
+import { SidecarProcesses } from '../security/processSupervisor/sidecarLifecycle.ts';
 
 export class MissingDefaultFilesOptionError extends Error {
 	constructor() {
@@ -70,6 +71,7 @@ export class Scope extends EventEmitter<ScopeEventsMap> {
 	#deployInFlight: boolean = false;
 	#restartRequestedDuringDeploy: boolean = false;
 	#optionsReady: boolean = false;
+	#processes?: SidecarProcesses;
 	applicationScope?: ApplicationScope;
 
 	options: OptionsWatcher;
@@ -96,6 +98,14 @@ export class Scope extends EventEmitter<ScopeEventsMap> {
 	 * fastify routes register on the bare server).
 	 */
 	mount?: ScopeMount;
+
+	/**
+	 * Sidecar processes this plugin manages: `scope.processes.start(descriptor)` spawns through the PID lock one of each
+	 * name per node, however many threads load the plugin; on Linux and darwin a keeper outlives the thread that started it.
+	 */
+	get processes(): SidecarProcesses {
+		return (this.#processes ??= new SidecarProcesses(this.#logger));
+	}
 
 	constructor(
 		appName: string,
